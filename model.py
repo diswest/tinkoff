@@ -1,8 +1,11 @@
 import pandas as pd
+import xgboost as xgb
 import re
 
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import cross_val_score, KFold
+
 
 
 def clean_dataset(df, dropna=True):
@@ -68,7 +71,7 @@ def check(clf, X, y):
 
 def predict(clf, X_train, y_train, X_test):
     clf.fit(X_train, y_train)
-    return clf.predict(X_test)
+    return clf.predict_proba(X_test)
 
 
 print('Prepare datasets...')
@@ -76,27 +79,24 @@ train, test = prepare()
 y_train = train['open_account_flg']
 X_train = train.drop('open_account_flg', axis=1)
 
-
-rf = RandomForestClassifier(
-    n_estimators=50,
-    min_samples_leaf=50,
-    min_samples_split=20,
-    max_features=None,
-    random_state=42,
-    n_jobs=-1
-)
+gbm = xgb.XGBClassifier(max_depth=3, n_estimators=300, learning_rate=0.05)
 
 print('Check...')
-print('Result: %s' % check(rf, X_train, y_train))
+print('Result: %s' % check(gbm, X_train, y_train))
 
 print('Predict...')
 X_test = test
-pred = predict(rf, X_train, y_train, X_test)
+pred = predict(gbm, X_train, y_train, X_test)
+
+predictions = []
+for p in pred[:,1]:
+    v = 1 if p >= 0.5 else 0
+    predictions.append(v)
 
 df = pd.read_csv('data/credit_test.csv', sep=';')
 submission = pd.DataFrame({
     '_ID_': df['client_id'],
-    '_VAL_': pred
+    '_VAL_': predictions
 })
 
 print('Submission [%s]:' % submission.shape[0])
