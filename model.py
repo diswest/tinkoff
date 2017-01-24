@@ -78,12 +78,11 @@ X_train = train.drop('open_account_flg', axis=1)
 
 
 rf = RandomForestClassifier(
-    n_estimators=100,
+    n_estimators=50,
     min_samples_leaf=50,
     min_samples_split=20,
     max_features=None,
     random_state=42,
-    oob_score=True,
     n_jobs=-1
 )
 
