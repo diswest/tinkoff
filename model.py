@@ -77,7 +77,15 @@ y_train = train['open_account_flg']
 X_train = train.drop('open_account_flg', axis=1)
 
 
-rf = RandomForestClassifier(n_estimators=100)
+rf = RandomForestClassifier(
+    n_estimators=100,
+    min_samples_leaf=50,
+    min_samples_split=20,
+    max_features=None,
+    random_state=42,
+    oob_score=True,
+    n_jobs=-1
+)
 
 print('Check...')
 print('Result: %s' % check(rf, X_train, y_train))
