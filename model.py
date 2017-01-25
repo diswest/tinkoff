@@ -41,11 +41,10 @@ def clean_dataset(df, dropna=True):
         result = re.sub('\W', '', result)
         result = re.sub('АЯ(\W|$)|ИЙ(\W|$)', '', result)
         result = re.sub('.*ЧУВАШ.*', 'ЧУВАШ', result)
-        if result == 'НОВСК':
-            print(region)
         return result
 
-    df['living_region'] = df['living_region'].apply(clean_region)
+    #df['living_region'] = df['living_region'].apply(clean_region)
+    df.drop('living_region', axis=1, inplace=True)
 
     return df
 
@@ -55,7 +54,8 @@ def prepare():
     test = clean_dataset(pd.read_csv('data/credit_test.csv', sep=';'), dropna=False)
 
     # Convert categorical features
-    columns = ['gender', 'marital_status', 'job_position', 'tariff_id', 'education', 'living_region']
+    #columns = ['gender', 'marital_status', 'job_position', 'tariff_id', 'education', 'living_region']
+    columns = ['gender', 'marital_status', 'job_position', 'tariff_id', 'education']
     for col in columns:
         categories = train[col].copy().append(test[col].copy()).unique()
         train[col] = train[col].astype('category', categories=categories)
@@ -63,40 +63,28 @@ def prepare():
     return pd.get_dummies(train, columns=columns), pd.get_dummies(test, columns=columns)
 
 
-def check(clf, X, y):
-    kf = KFold(5, random_state=42)
-    scores = cross_val_score(clf, X, y, cv=kf, scoring='roc_auc')
-    return scores.mean()
-
-
-def predict(clf, X_train, y_train, X_test):
-    clf.fit(X_train, y_train)
-    return clf.predict_proba(X_test)
-
-
 print('Prepare datasets...')
-train, test = prepare()
+train, X_test = prepare()
 y_train = train['open_account_flg']
 X_train = train.drop('open_account_flg', axis=1)
+print(X_test.head(1))
 
 gbm = xgb.XGBClassifier(max_depth=3, n_estimators=300, learning_rate=0.05)
 
 print('Check...')
-print('Result: %s' % check(gbm, X_train, y_train))
+kf = KFold(5, random_state=42)
+scores = cross_val_score(gbm, X_train, y_train, cv=kf, scoring='roc_auc')
+print('Result: %s' % scores.mean())
 
+print('Fit...')
+gbm.fit(X_train, y_train)
 print('Predict...')
-X_test = test
-pred = predict(gbm, X_train, y_train, X_test)
-
-predictions = []
-for p in pred[:,1]:
-    v = 1 if p >= 0.5 else 0
-    predictions.append(v)
+pred = gbm.predict(X_test)
 
 df = pd.read_csv('data/credit_test.csv', sep=';')
 submission = pd.DataFrame({
     '_ID_': df['client_id'],
-    '_VAL_': predictions
+    '_VAL_': pred
 })
 
 print('Submission [%s]:' % submission.shape[0])
