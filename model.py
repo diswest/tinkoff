@@ -91,7 +91,8 @@ def fit_xgb(clf, X_train, y_train):
     # clf.set_params(n_estimators=cvresult.shape[0])
     # print('Optimal number of trees: %s' % cvresult.shape[0])
 
-    # Optimal number of trees: 3861 for learning rate 0.01
+    # Optimal number of trees: 3861 for learning rate 0.01 and CV AUC is 0.768535
+    # Optimal number of trees: 738 for learning rate 0.05 and CV AUC is 0.768169
 
     fit(clf, X_train, y_train)
 
@@ -102,7 +103,7 @@ y_train = train['open_account_flg']
 X_train = train.drop('open_account_flg', axis=1)
 
 xgb = XGBClassifier(
-    learning_rate=0.01,
+    learning_rate=0.05,
     n_estimators=5000,
     max_depth=5,
     subsample=0.9,
@@ -177,5 +178,5 @@ submission = pd.DataFrame({
 })
 
 print('Write submission to file...')
-submission.to_csv('submission_rf_xgb.csv', index=False)
+submission.to_csv('submission_xgb.csv', index=False)
 print('Done!')
