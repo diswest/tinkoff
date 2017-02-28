@@ -1,26 +1,32 @@
 import argparse
 import numpy as np
+import os
 import pandas as pd
 import re
+
 
 SEED = 42
 np.random.seed(SEED)
 
-from keras.models import Sequential
 from keras.layers import Dense
+from keras.models import Sequential
 from keras.wrappers.scikit_learn import KerasClassifier
-from scipy.stats import expon
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import cross_val_score, RandomizedSearchCV
+
+from lightgbm import LGBMClassifier
+
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import BaggingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegressionCV
 from sklearn.metrics import accuracy_score, roc_auc_score
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.model_selection import cross_val_score, StratifiedKFold, RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
+
 from xgboost import cv, DMatrix, XGBClassifier
 
-N_JOBS = 7
+N_JOBS = 1
+os.environ['OMP_NUM_THREADS'] = '%s' % 8
+# os.environ['JOBLIB_TEMP_FOLDER'] = '/notebooks/tmp'
 
 
 def clean_dataset(df, dropna=True):
@@ -33,11 +39,13 @@ def clean_dataset(df, dropna=True):
 
     # Clean data
     df.drop('client_id', axis=1, inplace=True)
-    df['monthly_income'].fillna(df['monthly_income'].median(), inplace=True)
-    df['credit_count'].fillna(df['credit_count'].median(), inplace=True)
-    df['overdue_credit_count'].fillna(df['overdue_credit_count'].median(), inplace=True)
+    df['monthly_income'].replace(0, np.nan, inplace=True)
+    df['monthly_income'].fillna(df['monthly_income'].mean(), inplace=True)
+    df['credit_count'].fillna(df['credit_count'].mean(), inplace=True)
+    df['overdue_credit_count'].fillna(df['overdue_credit_count'].mean(), inplace=True)
     if dropna:
         df.dropna(axis=0, inplace=True)
+        df.reset_index(drop=True, inplace=True)
 
     def clean_region(region):
         if type(region) != str:
@@ -63,11 +71,8 @@ def clean_dataset(df, dropna=True):
 
     # Add metafeatures
     df['monthly_payment'] = df['credit_sum'] / df['credit_month']
-    df['monthly_payment'] = df['monthly_payment'].replace(np.inf, np.nan, ).fillna(df['monthly_payment'].median())
     df['monthly_payment_to_income'] = df['monthly_payment'] / df['monthly_income']
-    df['monthly_payment_to_income'] = df['monthly_payment_to_income'].replace(np.inf, np.nan).fillna(df['monthly_payment_to_income'].median())
     df['credit_sum_to_income'] = df['credit_sum'] / df['monthly_income']
-    df['credit_sum_to_income'] = df['credit_sum_to_income'].replace(np.inf, np.nan).fillna(df['credit_sum_to_income'].median())
 
     return df
 
@@ -79,10 +84,35 @@ def prepare():
     # Convert categorical features
     columns = ['gender', 'marital_status', 'job_position', 'tariff_id', 'education', 'living_region']
     for col in columns:
-        categories = train[col].copy().append(test[col].copy()).unique()
+        categories = train[col].copy().append(test[col]).unique()
         train[col] = train[col].astype('category', categories=categories)
         test[col] = test[col].astype('category', categories=categories)
     return pd.get_dummies(train, columns=columns), pd.get_dummies(test, columns=columns)
+
+
+def prepare_dropout():
+    train = clean_dataset(pd.read_csv('data/credit_train.csv', sep=';'))
+    test = clean_dataset(pd.read_csv('data/credit_test.csv', sep=';'), dropna=False)
+
+    result = {}
+
+    for skip_col in train.columns:
+        if skip_col == 'open_account_flg':
+            continue
+        tr = train.drop(skip_col, axis=1)
+        ts = test.drop(skip_col, axis=1)
+
+        # Convert categorical features
+        columns = ['gender', 'marital_status', 'job_position', 'tariff_id', 'education', 'living_region']
+        if skip_col in columns:
+            columns.remove(skip_col)
+
+        for col in columns:
+            categories = tr[col].copy().append(ts[col].copy()).unique()
+            tr[col] = tr[col].astype('category', categories=categories)
+            ts[col] = ts[col].astype('category', categories=categories)
+        result[skip_col] = (pd.get_dummies(tr, columns=columns), pd.get_dummies(ts, columns=columns))
+    return result
 
 
 def fit(clf, X_train, y_train):
@@ -90,10 +120,10 @@ def fit(clf, X_train, y_train):
     clf.fit(X_train, y_train)
 
     print('CV...')
+    cv_score = cross_val_score(clf, X_train, y_train, cv=5, scoring='roc_auc', verbose=2, n_jobs=N_JOBS)
+
     train_pred = clf.predict(X_train)
     train_predprob = clf.predict_proba(X_train)[:, 1]
-
-    cv_score = cross_val_score(clf, X_train, y_train, cv=5, scoring='roc_auc', verbose=1)
 
     if type(y_train) == pd.DataFrame:
         print('Accuracy: %f' % accuracy_score(y_train.values, train_pred))
@@ -108,296 +138,348 @@ def fit(clf, X_train, y_train):
         np.std(cv_score)
     ))
 
-def tune(clf, param_test, X_train, y_train):
+    return np.mean(cv_score)
+
+
+def tune(clf, param_test, X_train, y_train, n=60):
     scv = RandomizedSearchCV(
         estimator=clf,
         param_distributions=param_test,
-        n_iter=60,
+        n_iter=n,
         scoring='roc_auc',
         n_jobs=N_JOBS,
         iid=False,
         cv=3,
         verbose=2
     )
-    scv.fit(X_train.loc[:40000].as_matrix(), y_train.loc[:40000].as_matrix())
+    scv.fit(X_train.as_matrix(), y_train.as_matrix())
     print(scv.best_params_)
     print(scv.best_score_)
 
 
-def cv_xgb(clf, X_train, y_train):
+def fit_stacking(l1_models_pool, l2_model, X_train, y_train, X_test, l1_features=None):
+    print()
+    print('Stacking:')
+
+    print('Generate L1 train metafeatures:')
+
+    l1_df_train = pd.DataFrame(index=X_train.index)
+    l1_models_to_fit = {}
+    for name, model in l1_models_pool.items():
+        pred = load_l1_predictions('%s_folded' % name)
+        if pred is None:
+            l1_models_to_fit[name] = model
+        else:
+            l1_df_train[name] = pred
+
+    if l1_models_to_fit:
+        fit_stacking_l1_folded(l1_models_to_fit, X_train, y_train, l1_features)
+        pred = predict_stacking_l1(l1_models_to_fit, X_train, l1_features)
+        l1_df_train.update(pred)
+        for name, data in pred.items():
+            save_l1_predictions('%s_folded' % name, data)
+
+    l1_df_train.dropna(inplace=True)
+
+    print('Generate L1 test metafeatures:')
+
+    l1_df_test = pd.DataFrame(index=X_test.index)
+    l1_models_to_fit = {}
+    for name, model in l1_models_pool.items():
+        pred = load_l1_predictions(name)
+        if pred is None:
+            l1_models_to_fit[name] = model
+        else:
+            l1_df_test[name] = pred
+
+    if l1_models_to_fit:
+        fit_stacking_l1(l1_models_to_fit, X_train, y_train, l1_features)
+        pred = predict_stacking_l1(l1_models_to_fit, X_test, l1_features)
+        l1_df_test.update(pred)
+        for name, data in pred.items():
+            save_l1_predictions('%s' % name, data)
+
+    print('Fit L2 model...')
+    return l1_df_test, fit(l2_model, l1_df_train, y_train)
+
+
+def fit_stacking_l1(l1_models_pool, X, y, features=None):
+    print('Fit L1 models:')
+    if not features:
+        features = {}
+
+    model_idx = 0
+
+    for name, clf in l1_models_pool.items():
+        model_idx += 1
+        print('[%s/%s] %s...' % (model_idx, len(l1_models_pool), name))
+
+        predictors = features[name] if name in features else X.columns
+        clf.fit(X[predictors], y)
+
+
+def fit_stacking_l1_folded(l1_models_pool, X, y, features=None):
+    print('Fit L1 models (folded):')
+    if not features:
+        features = {}
+
+    seed_offset = 0
+    model_idx = 0
+
+    l1_df = pd.DataFrame(index=y.index)
+
+    for name, clf in l1_models_pool.items():
+        model_idx += 1
+        print('[%s/%s] %s:' % (model_idx, len(l1_models_pool), name))
+        l1_df[name] = np.nan
+        kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED+seed_offset)
+        fold_idx = 0
+        folds_cv = []
+        for train, test in kf.split(X, y):
+            fold_idx += 1
+            print('[%s/%s] fold %s...' % (model_idx, len(l1_models_pool), fold_idx))
+
+            predictors = features[name] if name in features else X.columns
+            X_train, y_train = X[predictors].loc[train], y.loc[train]
+            X_test, y_test = X[predictors].loc[test], y.loc[test]
+
+            clf.fit(X_train, y_train)
+
+            pred_proba = clf.predict_proba(X_test)[:, 1]
+            folds_cv.append(roc_auc_score(y_test, pred_proba))
+            pred_df = pd.DataFrame({name: pred_proba}, index=y_test.index)
+            l1_df.update(pred_df)
+        print('[%s/%s] CV AUC Score: min: %f, max: %f, mean: %f, std: %f' % (
+            model_idx,
+            len(l1_models_pool),
+            np.min(folds_cv),
+            np.max(folds_cv),
+            np.mean(folds_cv),
+            np.std(folds_cv),
+        ))
+
+        seed_offset += 1
+
+    return l1_df
+
+
+def predict_stacking_l1(l1_models_pool, X, features=None):
+    print('Predict L1 models...')
+    if not features:
+        features = {}
+
+    model_idx = 0
+
+    l1_df = pd.DataFrame()
+
+    for name, clf in l1_models_pool.items():
+        model_idx += 1
+        print('[%s/%s] %s...' % (model_idx, len(l1_models_pool), name))
+
+        l1_df[name] = np.nan
+
+        predictors = features[name] if name in features else X.columns
+        pred_proba = clf.predict_proba(X[predictors])[:, 1]
+
+        l1_df[name] = pred_proba
+
+    return l1_df
+
+
+def load_l1_predictions(name):
+    fname = 'models/%s.csv' % name
+    if os.path.isfile(fname):
+        print('Load %s from cache' % name)
+        return pd.read_csv(fname, header=None)
+    else:
+        return None
+
+
+def save_l1_predictions(name, df):
+    fname = 'models/%s.csv' % name
+    print('Save %s to cache' % name)
+    df.to_csv(fname, index=False)
+
+
+def xgb():
+    return XGBClassifier(
+        learning_rate=0.05,
+        n_estimators=738,
+        max_depth=5,
+        subsample=0.9,
+        colsample_bytree=0.6,
+        nthread=4,
+        seed=SEED
+    )
+
+
+def xgb_cv(clf, X_train, y_train):
     print('Select XGBoost n_estimators value...')
     xgb_param = clf.get_xgb_params()
     xgtrain = DMatrix(X_train, label=y_train)
-    cvresult = cv(xgb_param, xgtrain, num_boost_round=clf.get_params()['n_estimators'], nfold=5,
-                  metrics='auc', early_stopping_rounds=50, verbose_eval=True)
+    cvresult = cv(
+        xgb_param,
+        xgtrain,
+        num_boost_round=clf.get_params()['n_estimators'],
+        nfold=5,
+        metrics='auc',
+        early_stopping_rounds=50,
+        verbose_eval=True
+    )
     clf.set_params(n_estimators=cvresult.shape[0])
     print('Optimal number of trees: %s' % cvresult.shape[0])
 
     return clf
 
-    # Optimal number of trees: 3861 for learning rate 0.01 and CV AUC is 0.768535
-    # Optimal number of trees: 738 for learning rate 0.05 and CV AUC is 0.768169 // Better on the test set
 
-
-def xgb(X_train, y_train, X_test):
-    print('XGBoost:')
-
-    # clf = XGBClassifier(
-    #     learning_rate=0.05,
-    #     n_estimators=738,
-    #     max_depth=5,
-    #     subsample=0.9,
-    #     colsample_bytree=0.6,
-    #     seed=SEED
-    # )
-
-    clf = XGBClassifier(
-        learning_rate=0.05,
-        n_estimators=1000,  # 338(0.765053)
-        max_depth=4,
-        subsample=0.5,
-        colsample_bytree=0.8,
-        seed=SEED
+def xgb_bag():
+    return BaggingClassifier(
+        base_estimator=xgb(),
+        n_estimators=14,
+        random_state=SEED
     )
 
-    fit(clf, X_train, y_train)
-    print('Predict...')
-    pred = clf.predict_proba(X_test)
 
-    return pred[:, 1]
-
-
-def tune_xgb(X_train, y_train):
-    print('Tune XGBoost...')
-
-    param_test = {
-        'max_depth': range(1, 6),
-        'subsample': [i/10 for i in range(1, 10)],
-        'colsample_bytree': [i/10 for i in range(1, 10)],
-        'min_child_weight': range(1, 6),
-    }
-    clf = XGBClassifier(
-        learning_rate=0.05,
-        seed=SEED
-    )
-
-    tune(clf, param_test, X_train, y_train)
+def xgb_bag_calibrated():
+    return CalibratedClassifierCV(xgb_bag(), cv=5)
 
 
 def create_nn():
     model = Sequential()
-    model.add(Dense(155, input_dim=174, init='uniform', activation='relu'))
+    model.add(Dense(155, input_dim=71, init='uniform', activation='relu'))
     model.add(Dense(1, init='uniform', activation='sigmoid'))
     model.compile(loss='binary_crossentropy', optimizer='Adamax', metrics=['accuracy'])
 
     return model
 
 
-def nn(X_train, y_train, X_test):
-    print('Keras:')
-
+def nn():
     estimators = [
         ('standardize', StandardScaler()),
-        ('nn', KerasClassifier(build_fn=create_nn, nb_epoch=10, batch_size=60, verbose=1))
+        ('nn', KerasClassifier(build_fn=create_nn, nb_epoch=10, batch_size=60, verbose=0))
     ]
-    clf = Pipeline(estimators)
 
-    fit(clf, X_train.as_matrix(), y_train.as_matrix())
-    print('Predict...')
-    pred = clf.predict_proba(X_test.as_matrix())
-
-    return pred[:, 1]
+    return Pipeline(estimators)
 
 
-def tune_nn(X_train, y_train):
-    print('Tune Keras...')
-
-    param_test = {
-        'nn__nb_epoch': range(10, 100),
-        'nn__batch_size': range(10, 100),
-        'nn__loss': ['mse', 'mae', 'mape', 'msle', 'squared_hinge', 'hinge', 'binary_crossentropy', 'kld', 'poisson',
-                     'cosine_proximity'],
-        'nn__neurons': range(10, 200),
-    }
-    estimators = [
-        ('standardize', StandardScaler()),
-        ('nn', KerasClassifier(build_fn=create_nn, verbose=0))
-    ]
-    clf = Pipeline(estimators)
-
-    tune(clf, param_test, X_train, y_train)
+def nn_bag():
+    return BaggingClassifier(
+        nn(),
+        n_estimators=10,
+        random_state=SEED
+    )
 
 
-def knn(X_train, y_train, X_test):
-    print('KNN:')
-
-    estimators = [
-        ('standardize', StandardScaler()),
-        ('knn', KNeighborsClassifier(n_jobs=N_JOBS))
-    ]
-    clf = Pipeline(estimators)
-
-    fit(clf, X_train, y_train)
-    print('Predict...')
-    pred = clf.predict_proba(X_test)
-
-    return pred[:, 1]
-
-
-def tune_knn(X_train, y_train):
-    print('Tune KNN...')
-
-    param_test = {
-        'knn__n_neighbors': range(2, 20),
-        'knn__weights': ['uniform', 'distance'],
-        'knn__algorithm': ['auto', 'ball_tree', 'kd_tree', 'brute'],
-        'knn__leaf_size': range(10, 100)
-    }
-    estimators = [
-        ('standardize', StandardScaler()),
-        ('knn', KNeighborsClassifier(n_jobs=N_JOBS))
-    ]
-    clf = Pipeline(estimators)
-
-    tune(clf, param_test, X_train, y_train)
-
-
-def rf(X_train, y_train, X_test):
-    print('RF:')
-
-    clf = RandomForestClassifier(
+def rf():
+    return RandomForestClassifier(
+        n_estimators=252,
+        min_samples_split=6,
+        min_samples_leaf=5,
+        max_features='sqrt',
+        max_depth=9,
         n_jobs=N_JOBS,
         random_state=SEED
     )
 
-    fit(clf, X_train, y_train)
-    print('Predict...')
-    pred = clf.predict_proba(X_test)
 
-    return pred[:, 1]
+def gbm():
+    return LGBMClassifier(
+        learning_rate=0.05,
+        scale_pos_weight=2,
+        num_leaves=30,
+        n_estimators=480,
+        min_child_weight=1,
+        min_child_samples=12,
+        max_bin=110,
+        colsample_bytree=0.3,
+        seed=SEED
+    )
 
 
-def tune_rf(X_train, y_train):
-    print('Tune RF...')
-    param_test = {
-        'n_estimators': range(1, 300),
-        'max_features': ['auto', 'sqrt', 'log2', None],
-        'max_depth': range(1, 10),
-        'min_samples_split': range(2, 20),
-        'min_samples_leaf': range(1, 20)
-    }
-
-    clf = RandomForestClassifier(
-        n_jobs=N_JOBS,
+def gbm_bag():
+    return BaggingClassifier(
+        base_estimator=gbm(),
+        n_estimators=19,
         random_state=SEED
     )
 
-    tune(clf, param_test, X_train, y_train)
 
-
-def lr(X_train, y_train, X_test):
-    print('LR:')
-
-    estimators = [
-        ('standardize', StandardScaler()),
-        ('lr', LogisticRegression(C=0.0779, solver='sag', n_jobs=N_JOBS, random_state=SEED))
-    ]
-    clf = Pipeline(estimators)
-
-    fit(clf, X_train, y_train)
-    print('Predict...')
-    pred = clf.predict_proba(X_test)
-
-    return pred[:, 1]
-
-
-def tune_lr(X_train, y_train):
-    print('Tune LR...')
-    param_test = {
-        'lr__C': expon(scale=100),
-        'lr__solver': ['newton-cg', 'lbfgs', 'liblinear', 'sag']
-    }
-    estimators = [
-        ('standardize', StandardScaler()),
-        ('lr', LogisticRegression(n_jobs=N_JOBS, random_state=SEED))
-    ]
-    clf = Pipeline(estimators)
-
-    tune(clf, param_test, X_train, y_train)
-
-
-def svm(X_train, y_train, X_test):
-    print('SVM:')
-
-    estimators = [
-        ('standardize', StandardScaler()),
-        ('svm', SVC(random_state=SEED))
-    ]
-    clf = Pipeline(estimators)
-
-    fit(clf, X_train, y_train)
-    print('Predict...')
-    pred = clf.predict_proba(X_test)
-
-    return pred[:, 1]
-
-
-def tune_svm(X_train, y_train):
-    print('Tuning SVM...')
-    param_test = {
-        'svm__C': expon(scale=100),
-        'svm__kernel': ['linear', 'poly', 'rbf', 'sigmoid'],
-        'svm__degree': range(1, 10),
-        'svm__gamma': expon(scale=.1),
-        'svm__class_weight': ['balanced', None]
-    }
-    estimators = [
-        ('standardize', StandardScaler()),
-        ('svm', SVC(random_state=SEED))
-    ]
-    clf = Pipeline(estimators)
-
-    tune(clf, param_test, X_train, y_train)
+def calibrated(clf):
+    return CalibratedClassifierCV(clf, cv=5)
 
 
 def run(submission_name):
-    l1_models_pool = {
-        'xgb': xgb,
-        'nn': nn,
-        'knn': knn,
-        'rf': rf,
-        'lr': lr,
-        'svm': svm
-    }
-
     print('Prepare datasets...')
     train, X_test = prepare()
-
     y_train = train['open_account_flg']
     X_train = train.drop('open_account_flg', axis=1)
 
+    #  Part 1. Boosting. (Part 2 must be commented)
 
-    # tune_svm(X_train, y_train)
-    # for i in range(5):
-    #     print('#' * 80)
-    # tune_knn(X_train, y_train)
-    # for i in range(5):
-    #     print('#' * 80)
-    # tune_rf(X_train, y_train)
-    # return
+    l1_features = {
+        'xgb': [feature for feature in X_train.columns
+                if feature not in ['monthly_payment', 'monthly_payment_to_income', 'credit_sum_to_income']],
+        'nn': [feature for feature in X_train.columns
+               if feature not in ['credit_sum_to_income'] and feature[:13] != 'living_region'],
+        'rf': [feature for feature in X_train.columns
+               if feature[:13] != 'living_region'],
+        'gbm': [feature for feature in X_train.columns
+                if feature not in ['monthly_income', 'monthly_payment_to_income']]
+    }
 
+    l1_models_pool = {
+        'xgb': calibrated(xgb_bag()),
+        # 'nn': calibrated(nn_bag()),
+        # 'rf': calibrated(rf()),
+        'gbm': calibrated(gbm_bag())
+    }
+    l2_model = LogisticRegressionCV(
+        cv=5,
+        scoring='roc_auc',
+        max_iter=10000,
+        solver='sag',
+        class_weight='balanced',
+        n_jobs=N_JOBS,
+        random_state=SEED
+    )
 
-    pred = xgb(X_train, y_train, X_test)
+    l1_df, cv_score = fit_stacking(
+        l1_models_pool,
+        l2_model,
+        X_train, y_train,
+        X_test,
+        l1_features=l1_features
+    )
 
+    print()
+    print('Predict...')
+    pred = l2_model.predict_proba(l1_df)[:, 1]
+
+    # End part 1
+
+    # Part 2. Over previous submissions (Part 1 must be commented)
+
+    df = pd.DataFrame({
+        'stacked': pd.read_csv('submissions/stacking_xgb_gbm_calibrated_l2_lrcv_calibrated_0.79973117848.csv', index_col='_ID_')['_VAL_'].as_matrix(),
+        'xgb': load_l1_predictions('xgb')[0],
+        'gbm': load_l1_predictions('gbm')[0]
+    })
+
+    pred = df.mean(axis=1)
+
+    cv_score = '___'
+
+    # End part 2
+
+    print()
     print('Build submission...')
     df = pd.read_csv('data/credit_test.csv', sep=';')
     submission = pd.DataFrame({
         '_ID_': df['client_id'],
         '_VAL_': pred
     })
-
     print('Write submission to file (%s.csv)...' % submission_name)
-    submission.to_csv('submissions/%s.csv' % submission_name, index=False)
+    submission.to_csv('submissions/%s_%s.csv' % (submission_name, cv_score), index=False)
     print('Done!')
 
 
@@ -407,12 +489,3 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     run(args.submission)
-
-
-#### VOTING CLASSIFIER
-
-
-# Сделать фичи из отношения зарплаты и размера кредита к среднерегиональной зарплате
-# Сделать фичу из ежемесячного платежа
-# Сделать фичу из отношения ежемесячного платежа к зарплате
-# Попробовать угадывать регион по зарплате и работе
